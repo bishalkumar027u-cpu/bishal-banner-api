@@ -72,9 +72,9 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     banner_img = bytes_to_image(banner_bytes)
     pin_img = bytes_to_image(pin_bytes)
 
-    level = str(data.get("AccountLevel", "0"))
-    name = data.get("AccountName", "Unknown")
-    guild = data.get("GuildName", "")
+    level = str(data.get("level", "0"))
+    name = data.get("nickname", "Unknown")
+    guild = data.get("guild", "")
 
     TARGET_HEIGHT = 400 
     avatar_img = avatar_img.resize((TARGET_HEIGHT, TARGET_HEIGHT), Image.LANCZOS)
@@ -115,10 +115,9 @@ def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
     def draw_text_with_stroke(x, y, text, font, size):
         for dx in range(-size, size + 1):
             for dy in range(-size, size + 1):
-                draw.text((x + dx, y + dy), text, font=font, fill=stroke_col)
-        draw.text((x, y), text, font=font, fill=text_col)
+                draw.text((x + dx, y + dy), text, font=font, fill="black")
+        draw.text((x, y), text, font=font, fill="white")
 
-    stroke_col, text_col = "black", "white"
     draw_text_with_stroke(text_x + 25, text_y, name, font_large, 4)
     
     if guild:
@@ -159,7 +158,7 @@ async def home():
     }
 
 @app.get("/profile")
-async def get_banner(uid: str, region: str = "id"):
+async def get_banner(uid: str, region: str = "IND"):
     if not uid:
         raise HTTPException(status_code=400, detail="UID required")
 
@@ -171,22 +170,22 @@ async def get_banner(uid: str, region: str = "id"):
             
         data = resp.json()
         
-        # Parse the response based on the API structure
-        # Adjust these keys according to actual API response
-        acc = data.get("AccountInfo", data)
-        guild = data.get("GuildInfo", {})
+        # Parse from your API response structure
+        basicInfo = data.get("basicInfo", {})
+        clanInfo = data.get("clanBasicInfo", {})
         
-        if not acc: 
+        if not basicInfo:
             raise HTTPException(status_code=404, detail="Not Found")
         
-        # Try different possible key names
-        avatar_id = acc.get("AccountAvatarId") or acc.get("headPic") or acc.get("avatarId")
-        banner_id = acc.get("AccountBannerId") or acc.get("bannerId") or acc.get("banner")
+        # Get IDs from response
+        avatar_id = basicInfo.get("headPic") or basicInfo.get("avatarId")
+        banner_id = basicInfo.get("bannerId")
+        pin_id = basicInfo.get("title")
         
+        # Fetch images
         avatar_task = fetch_image_bytes(avatar_id)
         banner_task = fetch_image_bytes(banner_id)
         
-        pin_id = acc.get("pinId") or acc.get("title") or acc.get("pin")
         if pin_id and str(pin_id) != "0":
             pin_task = fetch_image_bytes(pin_id)
         else:
@@ -202,9 +201,9 @@ async def get_banner(uid: str, region: str = "id"):
 
         loop = asyncio.get_event_loop()
         banner_data = {
-            "AccountLevel": acc.get("AccountLevel") or acc.get("level") or acc.get("playerLevel") or "0",
-            "AccountName": acc.get("AccountName") or acc.get("nickname") or acc.get("playerName") or "Unknown",
-            "GuildName": guild.get("GuildName") or guild.get("clanName") or data.get("ClanName") or ""
+            "level": basicInfo.get("level", "0"),
+            "nickname": basicInfo.get("nickname", "Unknown"),
+            "guild": clanInfo.get("clanName", "")
         }
         
         img_io = await loop.run_in_executor(
