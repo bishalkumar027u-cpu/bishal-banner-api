@@ -37,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Old base64 encoded URL (for image CDN)
+# CDN URL for images
 BASE64 = "aHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL1NoYWhHQ3JlYXRvci9pY29uQG1haW4vUE5H"
 info_URL = base64.b64decode(BASE64).decode('utf-8')
 
@@ -94,9 +94,9 @@ def process_banner_image(data, avatar_bytes, banner_bytes):
     avatar_img = bytes_to_image(avatar_bytes)
     banner_img = bytes_to_image(banner_bytes)
 
-    level = str(data.get("AccountLevel", "0"))
-    name = data.get("AccountName", "Unknown")
-    guild = data.get("GuildName", "")
+    level = str(data.get("level", "0"))
+    name = data.get("nickname", "Unknown")
+    guild = data.get("guild", "")
 
     TARGET_HEIGHT = 400
 
@@ -171,7 +171,7 @@ def process_banner_image(data, avatar_bytes, banner_bytes):
 async def get_banner(region: str, uid: str):
     """
     Generate profile banner
-    Example: /profile/na/123456789
+    Example: /profile/IND/1576195175
     """
     if not uid:
         raise HTTPException(status_code=400, detail="UID required")
@@ -196,30 +196,34 @@ async def get_banner(region: str, uid: str):
 
     data = resp.json()
     
-    # Parse response (adjust field names based on actual API response)
-    account = data.get("AccountInfo") or data.get("playerInfo") or data.get("data") or {}
+    # Parse response based on actual API structure
+    basic_info = data.get("basicInfo", {})
+    profile_info = data.get("profileInfo", {})
+    clan_info = data.get("clanBasicInfo", {})
     
-    avatar_id = account.get("AccountAvatarId") or account.get("avatarId") or account.get("headPic")
-    banner_id = account.get("AccountBannerId") or account.get("bannerId")
-    player_level = account.get("AccountLevel") or account.get("level") or "0"
-    player_name = account.get("AccountName") or account.get("name") or "Unknown"
+    # Extract IDs - priority: profileInfo > basicInfo
+    avatar_id = profile_info.get("avatarId") or basic_info.get("headPic")
+    banner_id = basic_info.get("bannerId")
     
-    guild = data.get("GuildInfo", {})
-    guild_name = guild.get("GuildName") or guild.get("name") or ""
-
-    print(f"DEBUG: Avatar: {avatar_id}, Banner: {banner_id}")
-    print(f"DEBUG: {player_name} (Lvl.{player_level}) - {guild_name}")
+    # Player info
+    player_name = basic_info.get("nickname", "Unknown")
+    player_level = basic_info.get("level", "0")
+    
+    # Guild info
+    guild_name = clan_info.get("name", "") if clan_info else ""
+    
+    print(f"DEBUG: Avatar ID: {avatar_id}, Banner ID: {banner_id}")
+    print(f"DEBUG: {player_name} (Lvl.{player_level}) - Guild: {guild_name or 'No Guild'}")
 
     # Fetch images
-    avatar, banner = await asyncio.gather(
-        fetch_image_bytes(avatar_id),
-        fetch_image_bytes(banner_id)
-    )
+    avatar_task = fetch_image_bytes(avatar_id)
+    banner_task = fetch_image_bytes(banner_id)
+    avatar, banner = await asyncio.gather(avatar_task, banner_task)
     
     banner_data = {
-        "AccountLevel": player_level,
-        "AccountName": player_name,
-        "GuildName": guild_name
+        "level": player_level,
+        "nickname": player_name,
+        "guild": guild_name
     }
 
     loop = asyncio.get_event_loop()
@@ -236,6 +240,12 @@ async def get_banner(region: str, uid: str):
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=300"}
     )
+
+
+# ================= HEALTH CHECK =================
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
 
 if __name__ == "__main__":
