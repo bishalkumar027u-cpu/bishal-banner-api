@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import base64
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Response, HTTPException, Query
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Old base64 encoded URL (kept for reference/compatibility)
+# Old base64 encoded URL (for image CDN)
 BASE64 = "aHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL1NoYWhHQ3JlYXRvci9pY29uQG1haW4vUE5H"
 info_URL = base64.b64decode(BASE64).decode('utf-8')
 
@@ -166,72 +166,62 @@ def process_banner_image(data, avatar_bytes, banner_bytes):
     return img_io
 
 
-@app.get("/profile")
-async def get_banner(
-    uid: str = Query(..., description="User ID"),
-    region: str = Query("na", description="Game region (na, eu, asia, etc.)")
-):
+# ================= MAIN ENDPOINT =================
+@app.get("/profile/{region}/{uid}")
+async def get_banner(region: str, uid: str):
     """
-    Generate a profile banner image with avatar and banner
+    Generate profile banner
+    Example: /profile/na/123456789
     """
     if not uid:
         raise HTTPException(status_code=400, detail="UID required")
+    if not region:
+        raise HTTPException(status_code=400, detail="Region required")
 
-    # Call the new player info API
-    new_api_url = f"{PLAYER_INFO_API}?region={region}&uid={uid}"
-    print(f"DEBUG: Fetching from {new_api_url}")
+    # Call API with region and uid
+    api_url = f"{PLAYER_INFO_API}?region={region}&uid={uid}"
+    print(f"DEBUG: Fetching from {api_url}")
     
     try:
-        resp = await client.get(new_api_url)
+        resp = await client.get(api_url)
         print(f"DEBUG: Response status: {resp.status_code}")
         
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=502, 
-                detail=f"Player Info API Error: Status {resp.status_code}"
+                detail=f"API Error: {resp.status_code}"
             )
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="API request timeout")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"API request failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
 
     data = resp.json()
     
-    # Parse the response based on the actual API structure
-    # You'll need to adjust this based on the actual JSON response format
-    # This is a generic template:
-    account = data.get("AccountInfo", {})
-    if not account:
-        # Try alternative field names
-        account = data.get("playerInfo", {}) or data.get("data", {})
+    # Parse response (adjust field names based on actual API response)
+    account = data.get("AccountInfo") or data.get("playerInfo") or data.get("data") or {}
     
-    # Extract IDs (adjust field names as needed)
     avatar_id = account.get("AccountAvatarId") or account.get("avatarId") or account.get("headPic")
     banner_id = account.get("AccountBannerId") or account.get("bannerId")
-    
-    # Get player info
     player_level = account.get("AccountLevel") or account.get("level") or "0"
     player_name = account.get("AccountName") or account.get("name") or "Unknown"
     
-    # Get guild info if available
     guild = data.get("GuildInfo", {})
     guild_name = guild.get("GuildName") or guild.get("name") or ""
-    
-    print(f"DEBUG: Found IDs -> Avatar: {avatar_id}, Banner: {banner_id}")
 
-    # Fetch images asynchronously
-    avatar_task = fetch_image_bytes(avatar_id)
-    banner_task = fetch_image_bytes(banner_id)
-    avatar, banner = await asyncio.gather(avatar_task, banner_task)
+    print(f"DEBUG: Avatar: {avatar_id}, Banner: {banner_id}")
+    print(f"DEBUG: {player_name} (Lvl.{player_level}) - {guild_name}")
+
+    # Fetch images
+    avatar, banner = await asyncio.gather(
+        fetch_image_bytes(avatar_id),
+        fetch_image_bytes(banner_id)
+    )
     
-    # Prepare data for image processing
     banner_data = {
         "AccountLevel": player_level,
         "AccountName": player_name,
         "GuildName": guild_name
     }
 
-    # Process image in thread pool
     loop = asyncio.get_event_loop()
     img_io = await loop.run_in_executor(
         process_pool, 
@@ -243,31 +233,11 @@ async def get_banner(
 
     return Response(
         content=img_io.getvalue(), 
-        media_type="image/png", 
+        media_type="image/png",
         headers={"Cache-Control": "public, max-age=300"}
     )
 
 
-@app.get("/profile/legacy")
-async def get_banner_legacy(uid: str):
-    """
-    Legacy endpoint using the old API (kept for backward compatibility)
-    """
-    if not uid:
-        raise HTTPException(status_code=400, detail="UID required")
-
-    # Your old API implementation here...
-    # (Keep your original code as backup)
-    
-    return {"message": "Legacy endpoint - implement if needed"}
-
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "api": PLAYER_INFO_API}
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
