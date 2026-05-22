@@ -1,12 +1,65 @@
 import io
 import os
 import asyncio
+import base64
 import httpx
-from fastapi import FastAPI, Response, HTTPException, Query
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw, ImageFont
 
-app = FastAPI()
+# ================= ADJUSTMENT SETTINGS =================
+AVATAR_ZOOM = 1.26
+AVATAR_SHIFT_Y = 0
+AVATAR_SHIFT_X = 0
+
+BANNER_START_X = 0.25
+BANNER_START_Y = 0.29
+BANNER_END_X = 0.81
+BANNER_END_Y = 0.65
+# =======================================================
+
+# Your Info API
+INFO_API_URL = "https://infoapi.up.railway.app/player-info"
+
+BASE64 = "aHR0cHM6Ly9jZG4uanNkZWxpdnIubmV0L2doL1NoYWhHQ3JlYXRvci9pY29uQG1haW4vUE5H"
+info_URL = base64.b64decode(BASE64).decode("utf-8")
+
+# ✅ Vercel-safe: same folder as app.py
+BASE_DIR = os.path.dirname(__file__)
+
+# ✅ Your existing fonts (root)
+FONT_BOLD_PATH = os.path.join(BASE_DIR, "arial_unicode_bold.otf")
+FONT_REGULAR_PATH = os.path.join(BASE_DIR, "NotoSansCherokee.ttf")  # regular fallback
+
+timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+
+client = httpx.AsyncClient(
+    headers={"User-Agent": "Mozilla/5.0"},
+    timeout=timeout,
+    follow_redirects=True,
+    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+)
+
+process_pool = ThreadPoolExecutor(max_workers=4)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    try:
+        await client.aclose()
+    except Exception:
+        pass
+    try:
+        process_pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,188 +68,228 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Silent Info API
-INFO_API_URL = "https://silent-info-api.vercel.app/player-info"
 
-# Base directory
-BASE_DIR = os.path.dirname(__file__)
-
-# Font paths (same folder me rakhein)
-FONT_BOLD_PATH = os.path.join(BASE_DIR, "arial_unicode_bold.otf")
-FONT_REGULAR_PATH = os.path.join(BASE_DIR, "NotoSansCherokee.ttf")
-
+# ================= FONT LOADER (VERCEL SAFE) =================
 def load_font(size: int, bold: bool = False):
+    """
+    Vercel pe Termux dirs/subprocess/fc-match work nahi karte.
+    Isliye font files ko project me hi rakho (root).
+    """
+    path = FONT_BOLD_PATH if bold else FONT_REGULAR_PATH
+
+    # Try requested font
     try:
-        path = FONT_BOLD_PATH if bold else FONT_REGULAR_PATH
         if os.path.exists(path):
             return ImageFont.truetype(path, size)
-    except:
+    except Exception:
         pass
+
+    # Fallback: try the other one
+    try:
+        other = FONT_REGULAR_PATH if bold else FONT_BOLD_PATH
+        if os.path.exists(other):
+            return ImageFont.truetype(other, size)
+    except Exception:
+        pass
+
+    # Last fallback
     return ImageFont.load_default()
 
-# ============= DEBUG ENDPOINT - Pehle ye test karein =============
-@app.get("/debug")
-async def debug_api(uid: str = Query("14169575811"), region: str = Query("IN")):
-    """Check what data API is returning"""
-    url = f"{INFO_API_URL}?region={region}&uid={uid}"
-    
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url)
-        
-    return {
-        "status_code": resp.status_code,
-        "response": resp.json() if resp.status_code == 200 else None,
-        "raw_text": resp.text[:500] if resp.text else None
-    }
 
-# ============= MAIN BANNER ENDPOINT =============
-@app.get("/banner")
-async def get_banner(uid: str = Query(...), region: str = Query("IN")):
-    """Generate banner from API data"""
-    
-    # 1. Fetch data from info API
-    url = f"{INFO_API_URL}?region={region}&uid={uid}"
-    
-    async with httpx.AsyncClient(timeout=15.0) as client:
+# ================= INFO FETCH =================
+async def fetch_info(uid: str, retries: int = 3, delay: float = 0.6):
+    url = f"{INFO_API_URL}?uid={uid}"
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return resp.json()
+            raise HTTPException(status_code=502, detail=f"Info API Error: {resp.status_code}")
+        except httpx.TimeoutException as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(delay * attempt)
+                continue
+            raise HTTPException(status_code=504, detail="Info API timeout")
+        except httpx.RequestError as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(delay * attempt)
+                continue
+            raise HTTPException(status_code=502, detail="Info API request failed")
+
+    raise HTTPException(status_code=502, detail=f"Info API failed: {last_err}")
+
+
+async def fetch_image_bytes(item_id):
+    if not item_id or str(item_id) == "0":
+        return None
+
+    url = f"{info_URL}/{item_id}.png"
+    try:
         resp = await client.get(url)
-        
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"API Error: {resp.status_code}")
-        
-        data = resp.json()
-    
-    # 2. Extract data (adjust according to actual API response)
-    # Pehle debug endpoint se dekho response kaisa aa raha hai
-    if "data" in data:
-        player = data["data"]
-    else:
-        player = data
-    
-    # Try different possible field names
-    name = player.get("nickname") or player.get("name") or player.get("playerName") or "Unknown"
-    level = player.get("level") or player.get("accountLevel") or player.get("lvl") or "0"
-    likes = player.get("likes") or player.get("totalLikes") or player.get("like") or "0"
-    avatar_url = player.get("avatar") or player.get("headPic") or player.get("avatarUrl")
-    banner_url = player.get("banner") or player.get("bannerUrl")
-    
-    # 3. Create banner image
-    # Banner size
-    WIDTH = 1200
-    HEIGHT = 600
-    
-    # Create canvas
-    img = Image.new("RGB", (WIDTH, HEIGHT), "#1a1a2e")
-    draw = ImageDraw.Draw(img)
-    
-    # Draw gradient-like header
-    draw.rectangle([0, 0, WIDTH, 100], fill="#16213e")
-    
-    # Title
-    font_title = load_font(36, bold=True)
-    draw.text((50, 30), "FREE FIRE PROFILE", font=font_title, fill="#e94560")
-    
-    # Player Name (large)
-    font_name = load_font(48, bold=True)
-    
-    # Add stroke to name
-    for dx in [-2, -1, 0, 1, 2]:
-        for dy in [-2, -1, 0, 1, 2]:
-            draw.text((250 + dx, 150 + dy), name, font=font_name, fill="black")
-    draw.text((250, 150), name, font=font_name, fill="#ffffff")
-    
-    # Level
-    font_level = load_font(32, bold=True)
-    level_text = f"Level: {level}"
-    
-    # Level background pill
-    bbox = draw.textbbox((0, 0), level_text, font=font_level)
-    level_w = bbox[2] - bbox[0]
-    level_h = bbox[3] - bbox[1]
-    
-    draw.rectangle([250, 230, 250 + level_w + 30, 230 + level_h + 15], fill="#e94560", radius=20)
-    draw.text((265, 235), level_text, font=font_level, fill="#ffffff")
-    
-    # Likes
-    font_likes = load_font(28, bold=True)
-    draw.text((250, 290), f"❤️ Likes: {likes}", font=font_likes, fill="#ff6b6b")
-    
-    # UID
-    font_uid = load_font(24, bold=False)
-    draw.text((250, 340), f"UID: {uid}", font=font_uid, fill="#aaaaaa")
-    
-    # Draw avatar placeholder (circle)
-    avatar_size = 150
-    avatar_x = 50
-    avatar_y = 150
-    
-    # Outer circle
-    draw.ellipse([avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size], 
-                  outline="#e94560", width=4)
-    
-    # Inner circle
-    draw.ellipse([avatar_x + 5, avatar_y + 5, avatar_x + avatar_size - 5, avatar_y + avatar_size - 5],
-                  fill="#0f3460")
-    
-    # "A" in avatar
-    font_avatar = load_font(80, bold=True)
-    draw.text((avatar_x + 45, avatar_y + 35), "A", font=font_avatar, fill="#e94560")
-    
-    # Try to load actual avatar if URL exists
-    if avatar_url:
-        try:
-            async with httpx.AsyncClient() as client:
-                avatar_resp = await client.get(avatar_url)
-                if avatar_resp.status_code == 200:
-                    avatar_img = Image.open(io.BytesIO(avatar_resp.content))
-                    avatar_img = avatar_img.resize((avatar_size - 10, avatar_size - 10), Image.LANCZOS)
-                    
-                    # Create circular mask
-                    mask = Image.new("L", (avatar_size - 10, avatar_size - 10), 0)
-                    mask_draw = ImageDraw.Draw(mask)
-                    mask_draw.ellipse([0, 0, avatar_size - 10, avatar_size - 10], fill=255)
-                    
-                    img.paste(avatar_img, (avatar_x + 5, avatar_y + 5), mask)
-        except:
-            pass
-    
-    # Draw banner background if URL exists
-    if banner_url:
-        try:
-            async with httpx.AsyncClient() as client:
-                banner_resp = await client.get(banner_url)
-                if banner_resp.status_code == 200:
-                    banner_img = Image.open(io.BytesIO(banner_resp.content))
-                    banner_img = banner_img.resize((WIDTH, 200), Image.LANCZOS)
-                    img.paste(banner_img, (0, HEIGHT - 200))
-                    
-                    # Dark overlay for text readability
-                    overlay = Image.new("RGBA", (WIDTH, 200), (0, 0, 0, 128))
-                    img.paste(overlay, (0, HEIGHT - 200), overlay)
-        except:
-            pass
-    
-    # Bottom decorative line
-    draw.rectangle([0, HEIGHT - 10, WIDTH, HEIGHT], fill="#e94560")
-    
-    # Convert to bytes
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+def bytes_to_image(img_bytes):
+    if img_bytes:
+        return Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    return Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+
+
+# ================= IMAGE PROCESS =================
+def process_banner_image(data, avatar_bytes, banner_bytes, pin_bytes):
+    avatar_img = bytes_to_image(avatar_bytes)
+    banner_img = bytes_to_image(banner_bytes)
+    pin_img = bytes_to_image(pin_bytes)
+
+    level = str(data.get("AccountLevel", "0"))
+    name = str(data.get("AccountName", "Unknown"))
+    guild = str(data.get("GuildName", ""))
+
+    TARGET_HEIGHT = 400
+
+    # Avatar crop
+    zoom_size = int(TARGET_HEIGHT * AVATAR_ZOOM)
+    avatar_img = avatar_img.resize((zoom_size, zoom_size), Image.LANCZOS)
+
+    center_x = zoom_size // 2
+    center_y = zoom_size // 2
+    half_target = TARGET_HEIGHT // 2
+
+    left = center_x - half_target - AVATAR_SHIFT_X
+    top = center_y - half_target - AVATAR_SHIFT_Y
+    right = left + TARGET_HEIGHT
+    bottom = top + TARGET_HEIGHT
+
+    avatar_img = avatar_img.crop((left, top, right, bottom))
+    av_w, av_h = avatar_img.size
+
+    # Banner crop
+    b_w, b_h = banner_img.size
+    if b_w > 50 and b_h > 50:
+        banner_img = banner_img.rotate(3, expand=True)
+        b_w, b_h = banner_img.size
+
+        crop_left = b_w * BANNER_START_X
+        crop_top = b_h * BANNER_START_Y
+        crop_right = b_w * BANNER_END_X
+        crop_bottom = b_h * BANNER_END_Y
+        banner_img = banner_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+    b_w, b_h = banner_img.size
+    new_banner_w = int(TARGET_HEIGHT * (b_w / b_h) * 2) if b_h else 800
+    banner_img = banner_img.resize((new_banner_w, TARGET_HEIGHT), Image.LANCZOS)
+
+    final_w = av_w + new_banner_w
+    combined = Image.new("RGBA", (final_w, TARGET_HEIGHT))
+
+    combined.paste(avatar_img, (0, 0))
+    combined.paste(banner_img, (av_w, 0))
+
+    draw = ImageDraw.Draw(combined)
+
+    # Fonts
+    font_large = load_font(125, bold=True)
+    font_small = load_font(95, bold=True)
+    font_level = load_font(50, bold=True)
+
+    def safe_text(draw_obj, x, y, text, font, stroke=3):
+        for dx in range(-stroke, stroke + 1):
+            for dy in range(-stroke, stroke + 1):
+                draw_obj.text((x + dx, y + dy), text, font=font, fill="black")
+        draw_obj.text((x, y), text, font=font, fill="white")
+
+    safe_text(draw, av_w + 65, 40, name, font_large, stroke=4)
+    safe_text(draw, av_w + 65, 220, guild, font_small, stroke=3)
+
+    # Pin
+    if pin_img.size != (100, 100):
+        pin_img = pin_img.resize((130, 130), Image.LANCZOS)
+        combined.paste(pin_img, (0, TARGET_HEIGHT - 130), pin_img)
+
+    lvl_text = f"Lvl.{level}"
+    bbox = draw.textbbox((0, 0), lvl_text, font=font_level)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+
+    draw.rectangle(
+        [final_w - w - 60, TARGET_HEIGHT - h - 50, final_w, TARGET_HEIGHT],
+        fill="black",
+    )
+    draw.text(
+        (final_w - w - 30, TARGET_HEIGHT - h - 40),
+        lvl_text,
+        font=font_level,
+        fill="white",
+    )
+
     img_io = io.BytesIO()
-    img.save(img_io, "PNG")
+    combined.save(img_io, "PNG")
     img_io.seek(0)
-    
-    return Response(content=img_io.getvalue(), media_type="image/png")
+    return img_io
 
 
 @app.get("/")
 async def home():
-    return {
-        "message": "Free Fire Banner API",
-        "endpoints": {
-            "/banner?uid=YOUR_UID&region=IN": "Generate banner",
-            "/debug?uid=YOUR_UID&region=IN": "Check API response"
-        }
+    return {"status": "Banner API Running", "endpoint": "/profile?uid=UID"}
+
+
+@app.get("/profile")
+async def get_banner(uid: str):
+    if not uid:
+        raise HTTPException(status_code=400, detail="UID required")
+
+    data = await fetch_info(uid)
+
+    # Some APIs wrap inside "data"
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+
+    basic = (payload.get("basicInfo") or {}) if isinstance(payload, dict) else {}
+    clan = (payload.get("clanBasicInfo") or {}) if isinstance(payload, dict) else {}
+    captain = (payload.get("captainBasicInfo") or {}) if isinstance(payload, dict) else {}
+
+    if not basic:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    name = basic.get("nickname", "Unknown")
+    level = basic.get("level", "0")
+    guild_name = clan.get("clanName", "")
+
+    avatar_id = basic.get("headPic") or basic.get("avatarId") or basic.get("iconId") or 0
+    banner_id = basic.get("bannerId") or captain.get("bannerId") or basic.get("banner") or 0
+    pin_id = basic.get("pinId") or captain.get("pinId") or 0
+
+    avatar_task = fetch_image_bytes(avatar_id)
+    banner_task = fetch_image_bytes(banner_id)
+    pin_task = fetch_image_bytes(pin_id)
+
+    avatar, banner, pin = await asyncio.gather(avatar_task, banner_task, pin_task)
+
+    banner_data = {
+        "AccountLevel": level,
+        "AccountName": name,
+        "GuildName": guild_name,
     }
 
+    loop = asyncio.get_event_loop()
+    img_io = await loop.run_in_executor(
+        process_pool,
+        process_banner_image,
+        banner_data,
+        avatar,
+        banner,
+        pin,
+    )
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return Response(
+        content=img_io.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
